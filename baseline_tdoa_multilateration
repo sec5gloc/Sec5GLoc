@@ -1,0 +1,101 @@
+import argparse
+import pandas as pd
+import numpy as np
+import json
+from pathlib import Path
+from scipy.optimize import least_squares
+import logging
+from dataset import load_anchors, load_and_preprocess_data
+
+SPEED_OF_LIGHT = 3e8  # meters per second
+
+def tdoa_objective(p, anchors, tdoa, ref_idx):
+    """
+    Objective function for TDoA least-squares.
+    p: estimated position [x, y]
+    anchors: np.array of shape (N, 2)
+    tdoa: np.array of shape (N,) with Δt_i = TOA_i - TOA_ref
+    ref_idx: index of reference anchor
+    """
+    dists = np.linalg.norm(anchors - p, axis=1)
+    return (dists - dists[ref_idx] - SPEED_OF_LIGHT * tdoa)
+
+def multilateration(anchors, toas):
+    anchors = np.array(anchors)
+    toas = np.array(toas)
+    ref_idx = np.argmin(toas)  # use min TOA as reference
+
+    tdoa = toas - toas[ref_idx]
+    x0 = np.mean(anchors, axis=0) 
+
+    res = least_squares(tdoa_objective, x0, args=(anchors, tdoa, ref_idx))
+    return res.x
+
+def run_tdoa_baseline(df: pd.DataFrame, anchor_df: pd.DataFrame, output_path: Path):
+    results = []
+    grouped = df.groupby('burst_id')
+
+    for burst_id, group in grouped:
+        anchors_used = []
+        toas = []
+
+        for _, row in group.iterrows():
+            aid = str(row['anch_id'])
+            if aid not in anchor_df.index:
+                continue
+            anchors_used.append(anchor_df.loc[aid].values)
+            toas.append(row['TOA'])
+
+        if len(anchors_used) < 4:
+            logging.warning(f"Burst {burst_id} has fewer than 4 anchors. Skipping.")
+            continue
+
+        try:
+            pred_x, pred_y = multilateration(anchors_used, toas)
+            gt_x = group.iloc[0]['ref_x']
+            gt_y = group.iloc[0]['ref_y']
+            error = np.linalg.norm([pred_x - gt_x, pred_y - gt_y])
+
+            results.append({
+                'burst_id': burst_id,
+                'pred_x': pred_x,
+                'pred_y': pred_y,
+                'ref_x': gt_x,
+                'ref_y': gt_y,
+                'error': error
+            })
+        except Exception as e:
+            logging.error(f"Error processing burst {burst_id}: {e}")
+
+    results_df = pd.DataFrame(results)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    results_df.to_csv(output_path, index=False)
+
+    metrics = {
+        'mean': float(results_df['error'].mean()),
+        'median': float(results_df['error'].median()),
+        'p75': float(np.quantile(results_df['error'], 0.75)),
+        'p90': float(np.quantile(results_df['error'], 0.90)),
+        'count': len(results_df)
+    }
+    with open(output_path.parent / 'tdoa_metrics.json', 'w') as f:
+        json.dump(metrics, f, indent=2)
+
+    logging.info(f"Saved results to {output_path}")
+    logging.info(f"Metrics: {metrics}")
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--data-dir', type=str, default='./dataset')
+    parser.add_argument('--file', type=str, default='test_LOS-NLOS.csv')
+    parser.add_argument('--output', type=str, default='./baseline_TDOA_multilateration_results_LOS-NLOS/predictions.csv')
+    args = parser.parse_args()
+
+    logging.basicConfig(level=logging.INFO)
+
+    anchors = load_anchors(Path(args.data_dir) / 'anchors.txt')
+    df = load_and_preprocess_data(Path(args.data_dir) / args.file, anchors, is_training=True)
+    run_tdoa_baseline(df, anchors, Path(args.output))
+
+if __name__ == '__main__':
+    main()
